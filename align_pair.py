@@ -14,6 +14,7 @@ Example:
 import argparse
 import os
 import shutil
+import sys
 
 import jax
 import jax.numpy as jnp
@@ -97,14 +98,28 @@ Examples:
 
   Stiffer mesh (less deformation):
     python align_pair.py ref.zarr moving.zarr -o aligned.zarr --k0 0.1 --k 1.0
+
+Scale considerations:
+  When running on downsampled images, pixel-based parameters may need adjustment:
+  - max-magnitude, max-deviation: Scale with image resolution (e.g., divide by 2 for 2x downsampled)
+  - patch-size, stride: Usually keep similar values across scales for consistent correlation quality
 """
     )
 
     # ==========================================================================
+    # Device selection
+    # ==========================================================================
+    parser.add_argument('--list-devices', action='store_true',
+                        help='List available JAX devices and exit')
+    parser.add_argument('--device',
+                        help='JAX device to use (e.g., "cpu", "gpu", "gpu:0", "tpu"). '
+                             'Default: auto-select best available (GPU/TPU over CPU)')
+
+    # ==========================================================================
     # Input/Output arguments
     # ==========================================================================
-    parser.add_argument('reference', help='Reference image (ZARR or TIFF) - the target coordinate space')
-    parser.add_argument('moving', help='Moving image (ZARR or TIFF) - will be warped to match reference')
+    parser.add_argument('reference', nargs='?', help='Reference image (ZARR or TIFF) - the target coordinate space')
+    parser.add_argument('moving', nargs='?', help='Moving image (ZARR or TIFF) - will be warped to match reference')
     parser.add_argument('--output', '-o', default='aligned.zarr',
                         help='Output aligned image (default: aligned.zarr)')
     parser.add_argument('--output-flow-raw',
@@ -122,13 +137,15 @@ Examples:
     # Flow computation parameters
     # ==========================================================================
     flow_group = parser.add_argument_group('Flow Computation',
-        'Parameters for optical flow estimation via masked cross-correlation')
+        'Parameters for optical flow estimation via masked cross-correlation.')
     flow_group.add_argument('--patch-size', type=int, default=160,
                             help='Size of patches for cross-correlation (pixels). Larger patches are more '
-                                 'robust but capture less local detail. (default: 160)')
+                                 'robust but capture less local detail. Usually keep similar across scales. '
+                                 '(default: 160)')
     flow_group.add_argument('--stride', type=int, default=40,
                             help='Spacing between flow vectors (pixels). Smaller stride = denser flow field '
-                                 'but slower computation. Typically patch_size/4. (default: 40)')
+                                 'but slower computation. Typically patch_size/4. Usually keep similar across '
+                                 'scales. (default: 40)')
     flow_group.add_argument('--batch-size', type=int, default=256,
                             help='Number of patches to process in parallel on GPU. Reduce if running '
                                  'out of GPU memory. (default: 256)')
@@ -141,16 +158,18 @@ Examples:
     clean_group.add_argument('--min-peak-ratio', type=float, default=1.6,
                              help='Minimum ratio of best to second-best correlation peak. Higher values '
                                   'require more distinct matches. Set lower (1.2-1.4) for well-aligned '
-                                  'images. (default: 1.6)')
+                                  'images. Scale-independent. (default: 1.6)')
     clean_group.add_argument('--min-peak-sharpness', type=float, default=1.6,
                              help='Minimum sharpness of correlation peak. Higher values require sharper '
-                                  'peaks. Set lower (1.2-1.4) for smooth/low-contrast regions. (default: 1.6)')
+                                  'peaks. Set lower (1.2-1.4) for smooth/low-contrast regions. Scale-independent. '
+                                  '(default: 1.6)')
     clean_group.add_argument('--max-magnitude', type=float, default=80,
                              help='Maximum allowed flow magnitude (pixels). Vectors exceeding this are '
-                                  'rejected as outliers. (default: 80)')
+                                  'rejected as outliers. SCALE-DEPENDENT: divide by 2 for each downsample level. '
+                                  '(default: 80)')
     clean_group.add_argument('--max-deviation', type=float, default=20,
                              help='Maximum deviation from local median flow (pixels). Filters spatially '
-                                  'inconsistent vectors. Increase for images with large local deformations. '
+                                  'inconsistent vectors. SCALE-DEPENDENT: divide by 2 for each downsample level. '
                                   '(default: 20)')
 
     # ==========================================================================
@@ -192,11 +211,32 @@ Examples:
 
     args = parser.parse_args()
 
+    # Handle --list-devices (early exit)
+    if args.list_devices:
+        print("Available JAX devices:")
+        for i, d in enumerate(jax.devices()):
+            default_marker = " (default)" if i == 0 else ""
+            print(f"  [{i}] {d.device_kind} ({d.platform}){default_marker}")
+        sys.exit(0)
+
+    # Validate required arguments when not listing devices
+    if not args.reference or not args.moving:
+        parser.error("the following arguments are required: reference, moving")
+
+    # Set device if specified
+    if args.device:
+        try:
+            jax.config.update("jax_default_device", args.device)
+        except Exception as e:
+            print(f"Warning: Could not set device '{args.device}': {e}")
+            print("Continuing with default device...")
+
     print("=" * 60)
     print("SOFIMA 2D Pairwise Alignment")
     print("=" * 60)
 
     print(f"\nJAX devices: {jax.devices()}")
+    print(f"Using device: {jax.devices()[0]}")
 
     # Load images
     print(f"\n[1] Loading images...")
