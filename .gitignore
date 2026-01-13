@@ -2,3 +2,21 @@ __pycache__
 dist
 sofima.egg-info
 _version.py
+
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+pixi.lock
+
+# macOS
+.DS_Store
+
+# temp output files
+temp_*
+*.zarr/
+before_after.png
+flow_field.png
+overlay_comparison.png
+
+# test data folders
+pass*/
