@@ -21,6 +21,7 @@ pip = "*"
 tqdm = ">=4.67.1,<5"
 tifffile = ">=2025.12.20,<2026"
 zarr = ">=3.1.5,<4"
+h5py = ">=3.0"
 
 [pypi-dependencies]
 dataclasses-json = ">=0.5.6"

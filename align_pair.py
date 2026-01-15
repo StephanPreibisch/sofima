@@ -13,70 +13,24 @@ Example:
 
 import argparse
 import os
-import shutil
 import sys
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import matplotlib.pyplot as plt
-import zarr
-import tifffile
 
-from sofima import flow_field
 from sofima import flow_utils
 from sofima import map_utils
 from sofima import mesh
 from sofima import warp
 from connectomics.common import bounding_box
 
-
-def load_image(path):
-    """Load image from ZARR or TIFF."""
-    if path.endswith('.zarr'):
-        return np.array(zarr.open(path)[:])
-    elif path.endswith(('.tif', '.tiff')):
-        return tifffile.imread(path)
-    else:
-        raise ValueError(f"Unsupported format: {path}")
-
-
-def save_image(path, data):
-    """Save image to ZARR or TIFF."""
-    if path.endswith('.zarr'):
-        if os.path.exists(path):
-            shutil.rmtree(path)
-        zarr.save(path, data, zarr_format=2)
-    elif path.endswith(('.tif', '.tiff')):
-        tifffile.imwrite(path, data)
-    else:
-        raise ValueError(f"Unsupported format: {path}")
-
-
-def save_figure(fig, path):
-    """Save figure."""
-    fig.savefig(path, dpi=150, bbox_inches='tight')
-    print(f"Saved: {path}")
-    plt.close(fig)
-
-
-def compute_flow_single(ref, mov, patch_size, stride, batch_size=256):
-    """Compute flow field between two images.
-
-    Args:
-        ref: Reference image [y, x]
-        mov: Moving image [y, x]
-        patch_size: Size of correlation patches
-        stride: Spacing between flow vectors
-        batch_size: Number of patches to process in parallel
-
-    Returns:
-        flow: Flow field [2, y, x] with channels [x_disp, y_disp]
-              Also contains quality statistics (peak_ratio, sharpness, etc.)
-    """
-    mfc = flow_field.JAXMaskedXCorrWithStatsCalculator()
-    flow = mfc.flow_field(ref, mov, (patch_size, patch_size), (stride, stride), batch_size=batch_size)
-    return flow
+from sofima_utils import (
+    load_image, save_image, save_figure, compute_flow_single,
+    add_device_args, add_flow_args, add_cleaning_args, add_mesh_args,
+    handle_device_args, create_mesh_config
+)
 
 
 def main():
@@ -106,18 +60,10 @@ Scale considerations:
 """
     )
 
-    # ==========================================================================
     # Device selection
-    # ==========================================================================
-    parser.add_argument('--list-devices', action='store_true',
-                        help='List available JAX devices and exit')
-    parser.add_argument('--device',
-                        help='JAX device to use (e.g., "cpu", "gpu", "gpu:0", "tpu"). '
-                             'Default: auto-select best available (GPU/TPU over CPU)')
+    add_device_args(parser)
 
-    # ==========================================================================
     # Input/Output arguments
-    # ==========================================================================
     parser.add_argument('reference', nargs='?', help='Reference image (ZARR or TIFF) - the target coordinate space')
     parser.add_argument('moving', nargs='?', help='Moving image (ZARR or TIFF) - will be warped to match reference')
     parser.add_argument('--output', '-o', default='aligned.zarr',
@@ -133,103 +79,19 @@ Scale considerations:
     parser.add_argument('--visualize', '-v', action='store_true',
                         help='Save visualization PNGs (flow field, before/after, overlay)')
 
-    # ==========================================================================
-    # Flow computation parameters
-    # ==========================================================================
-    flow_group = parser.add_argument_group('Flow Computation',
-        'Parameters for optical flow estimation via masked cross-correlation.')
-    flow_group.add_argument('--patch-size', type=int, default=160,
-                            help='Size of patches for cross-correlation (pixels). Larger patches are more '
-                                 'robust but capture less local detail. Usually keep similar across scales. '
-                                 '(default: 160)')
-    flow_group.add_argument('--stride', type=int, default=40,
-                            help='Spacing between flow vectors (pixels). Smaller stride = denser flow field '
-                                 'but slower computation. Typically patch_size/4. Usually keep similar across '
-                                 'scales. (default: 40)')
-    flow_group.add_argument('--batch-size', type=int, default=256,
-                            help='Number of patches to process in parallel on GPU. Reduce if running '
-                                 'out of GPU memory. (default: 256)')
-
-    # ==========================================================================
-    # Flow cleaning parameters
-    # ==========================================================================
-    clean_group = parser.add_argument_group('Flow Cleaning',
-        'Parameters to filter out unreliable flow vectors. Vectors failing any criterion are set to NaN.')
-    clean_group.add_argument('--min-peak-ratio', type=float, default=1.6,
-                             help='Minimum ratio of best to second-best correlation peak. Higher values '
-                                  'require more distinct matches. Set lower (1.2-1.4) for well-aligned '
-                                  'images. Scale-independent. (default: 1.6)')
-    clean_group.add_argument('--min-peak-sharpness', type=float, default=1.6,
-                             help='Minimum sharpness of correlation peak. Higher values require sharper '
-                                  'peaks. Set lower (1.2-1.4) for smooth/low-contrast regions. Scale-independent. '
-                                  '(default: 1.6)')
-    clean_group.add_argument('--max-magnitude', type=float, default=80,
-                             help='Maximum allowed flow magnitude (pixels). Vectors exceeding this are '
-                                  'rejected as outliers. SCALE-DEPENDENT: divide by 2 for each downsample level. '
-                                  '(default: 80)')
-    clean_group.add_argument('--max-deviation', type=float, default=20,
-                             help='Maximum deviation from local median flow (pixels). Filters spatially '
-                                  'inconsistent vectors. SCALE-DEPENDENT: divide by 2 for each downsample level. '
-                                  '(default: 20)')
-
-    # ==========================================================================
-    # Mesh relaxation parameters (FIRE optimizer)
-    # ==========================================================================
-    mesh_group = parser.add_argument_group('Mesh Relaxation',
-        'Parameters for elastic mesh optimization using FIRE (Fast Inertial Relaxation Engine). '
-        'The mesh treats flow vectors as springs connecting sections.')
-    mesh_group.add_argument('--k0', type=float, default=0.01,
-                            help='Inter-section spring constant. Controls how strongly the mesh follows '
-                                 'the flow vectors. Higher = more faithful to flow, lower = smoother. '
-                                 '(default: 0.01)')
-    mesh_group.add_argument('--k', type=float, default=0.1,
-                            help='Intra-section spring constant. Controls mesh stiffness/rigidity. '
-                                 'Higher = more rigid (less local deformation), lower = more elastic. '
-                                 '(default: 0.1)')
-    mesh_group.add_argument('--dt', type=float, default=0.001,
-                            help='Initial integration timestep for FIRE optimizer. (default: 0.001)')
-    mesh_group.add_argument('--gamma', type=float, default=0.0,
-                            help='Damping coefficient. Usually 0 for FIRE. (default: 0.0)')
-    mesh_group.add_argument('--num-iters', type=int, default=1000,
-                            help='Iterations between convergence checks. Higher = fewer checks, more '
-                                 'efficient for large problems. (default: 1000)')
-    mesh_group.add_argument('--max-iters', type=int, default=100000,
-                            help='Maximum total iterations before giving up. (default: 100000)')
-    mesh_group.add_argument('--stop-v-max', type=float, default=0.005,
-                            help='Convergence threshold: max velocity. Optimization stops when all '
-                                 'mesh nodes move slower than this. (default: 0.005)')
-    mesh_group.add_argument('--dt-max', type=float, default=1000,
-                            help='Maximum timestep (adaptive). FIRE increases dt when making progress. '
-                                 '(default: 1000)')
-    mesh_group.add_argument('--start-cap', type=float, default=0.01,
-                            help='Initial cap on displacement per iteration. Prevents instability at '
-                                 'start. (default: 0.01)')
-    mesh_group.add_argument('--final-cap', type=float, default=10,
-                            help='Final cap on displacement per iteration. (default: 10)')
-    mesh_group.add_argument('--prefer-orig-order', action='store_true', default=True,
-                            help='Prefer original section ordering in optimization. (default: True)')
+    # Add shared argument groups
+    add_flow_args(parser)
+    add_cleaning_args(parser)
+    add_mesh_args(parser)
 
     args = parser.parse_args()
 
-    # Handle --list-devices (early exit)
-    if args.list_devices:
-        print("Available JAX devices:")
-        for i, d in enumerate(jax.devices()):
-            default_marker = " (default)" if i == 0 else ""
-            print(f"  [{i}] {d.device_kind} ({d.platform}){default_marker}")
-        sys.exit(0)
+    # Handle device listing/selection
+    handle_device_args(args, parser)
 
     # Validate required arguments when not listing devices
     if not args.reference or not args.moving:
         parser.error("the following arguments are required: reference, moving")
-
-    # Set device if specified
-    if args.device:
-        try:
-            jax.config.update("jax_default_device", args.device)
-        except Exception as e:
-            print(f"Warning: Could not set device '{args.device}': {e}")
-            print("Continuing with default device...")
 
     print("=" * 60)
     print("SOFIMA 2D Pairwise Alignment")
@@ -284,20 +146,7 @@ Scale considerations:
 
     # Mesh relaxation
     print(f"\n[4] Mesh relaxation (k0={args.k0}, k={args.k}, dt={args.dt}, stop_v_max={args.stop_v_max})...")
-    config = mesh.IntegrationConfig(
-        dt=args.dt,
-        gamma=args.gamma,
-        k0=args.k0,
-        k=args.k,
-        stride=(args.stride, args.stride),
-        num_iters=args.num_iters,
-        max_iters=args.max_iters,
-        stop_v_max=args.stop_v_max,
-        dt_max=args.dt_max,
-        start_cap=args.start_cap,
-        final_cap=args.final_cap,
-        prefer_orig_order=args.prefer_orig_order
-    )
+    config = create_mesh_config(args, args.stride)
 
     # For single pair, we solve directly
     x = np.zeros_like(cleaned)
